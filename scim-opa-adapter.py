@@ -215,7 +215,7 @@ if __name__ == "__main__":
     #    # Produce the new json.
     #docfopa = OPAvdoc(scim_info)
     #    # Update OPA.
-    #    #testopa = requests.put("https://keycloak-demo.cloud.cnaf.infn.it:8181/v1/data/iam", data=json.dumps(docfopa), headers = {"Content-Type": "application/json"})
+    #    #testopa = requests.put("https://<opa endpoint>", data=json.dumps(docfopa), headers = {"Content-Type": "application/json"})
     #    #print("OPA update "+str(datetime.now()))
     #    time.sleep(15)
 
