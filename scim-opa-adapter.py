@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+
+import requests
+import argparse
+import json
+import boto3
+import os
+import time
+import base64
+import json
+from datetime import datetime
+from jsonmerge import merge
+
+boto3.set_stream_logger(name='botocore')
+parser = argparse.ArgumentParser(
+                    prog = 'SOA',
+                    description = 'SOA exploits SCIM endpoint that is part of INDIGO IAM to authorize sub claim values')
+
+parser.add_argument('-i', '--clientid', type=str)
+parser.add_argument('-s', '--clientsecret', type=str)
+parser.add_argument('-u', '--username', type=str)
+parser.add_argument('-p', '--password', type=str)
+parser.add_argument('-r', '--issurl', type=str)
+parser.add_argument('-n', '--rgwuser', type=str)
+parser.add_argument('-a', '--rgwpass', type=str)
+parser.add_argument('-e', '--rgwend', type=str)
+parser.add_argument('-f', '--refresh', type=str)
+
+args = parser.parse_args()
+
+def iam_token(user=args.username, passw=args.password, issurl=args.issurl, clientid=args.clientid, clientsecret=args.clientsecret):
+    """
+    Retrieve token using username and password. 
+    Not favored.
+    """
+    payload = {'username': user,
+                'password': passw,
+                'scopes': 'scim scim:read',
+                'grant_type': 'device'
+                }
+    response = requests.post(issurl+'/token',
+            params=payload,
+            auth=(clientid, clientsecret)
+            )
+    return response
+
+def device_code(issurl=args.issurl, clientid=args.clientid, clientsecret=args.clientsecret):
+    """
+    Request device code from IAM.
+    """
+    payload = {'scope': 'scim scim:read offline_access',
+               'client_id': clientid
+               }
+    response = requests.post(issurl+'/devicecode',
+            params=payload,
+            auth=(clientid, clientsecret),
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            )
+    return response
+
+def device_token(devicecode, issurl=args.issurl, clientid=args.clientid, clientsecret=args.clientsecret):
+    """
+    Use device code to retrieve token.
+    """
+    payload = {'device_code': devicecode,
+               'audience': 'account',
+               'grant_type': 'urn:ietf:params:oauth:grant-type:device_code'}
+    response = requests.post(issurl+'/token',
+            params=payload,
+            auth=(clientid, clientsecret),
+            )
+    return response
+
+def refresh2token(refresh_token=args.refresh, issurl=args.issurl,  clientid=args.clientid, clientsecret=args.clientsecret):
+    """
+    Use Refresh token to request Access token
+    """
+    rpayload = {'scopes': 'scim scim:read',
+                'grant_type': 'refresh_token',
+                'audience': 'account',
+                'refresh_token': refresh_token
+                }
+    rresponse = requests.post(issurl+'/token',
+                params=rpayload,
+                auth=(clientid, clientsecret)
+                )
+    return rresponse
+
+def merge_jsons(*jsons):
+    """
+    create a dictionary by merging json arguments 
+    """
+    merged_dict = {}
+    for json_ in jsons:
+        merged_dict = merge(merged_dict, json_)
+    return merged_dict
+
+def number_of_users(token, issurl=args.issurl):
+    """
+    Get total of users within IAM
+    """
+    headers = {'Authorization': f'Bearer {token}'}
+    params = {'count': 0}
+    response = requests.get(issurl+'/scim/Users', headers=headers, params=params)
+    return response.json()['totalResults']
+
+def get_users(token, issurl=args.issurl):
+    """
+    Collect json from all pages and merge using merge_jsons
+    """
+    headers = {'Authorization': f'Bearer {token}'}
+    nusers = number_of_users(token, issurl)
+    hundreds = nusers // 100 + 1
+    pages = []
+    for index in range(hundreds):
+        start_index = index * 100 + 1
+        params = {'startIndex': start_index}
+        response = requests.get(issurl+'/scim/Users', headers=headers, params=params)
+        pages.append(json.loads(response.text))
+    return merge_jsons(pages)
+
+def iam_scim(accessToken, issurl=args.issurl):
+    """
+    This can be used if there is not pagination.
+    """
+    iam_token = accessToken
+    scim_users = requests.get(issurl+'/scim/Users',
+        headers={'Authorization': 'Bearer'+iam_token})
+
+    user_info = scim_users.json()
+    return user_info
+
+def OPAvdoc(scim_output):
+    """
+    Create a json from collected json with only id, username and group .
+    """
+    user_info = scim_output[0]
+    # print(scim_output[0])
+    users = {}
+    for i in user_info['Resources']:
+        groupList = []
+        try:
+            for x in i['groups']:
+                groupList.append(x['display'])
+        except:
+            pass
+        users[i['id']] = {'userName': i['userName'],
+            'groups': groupList
+            }
+    return users
+
+def iam_clients(access_token, issurl=args.issurl):
+    """
+    List all registered clients in IAM. 
+    NOTE: BLOAT
+    """
+    iam_token = access_token
+    clients = requests.get(issurl+'/api/clients',
+        headers={'Authorization': 'Bearer'+iam_token})
+
+    clients_info = clients.json()
+    return clients_info
+
+
+def rgw_idp_update(clientList, username=args.rgwuser, password=args.rgwpass, rgwurl=args.rgwend):
+    """
+    Update RadosGW with new client list.
+    NOTE: BLOAT
+    """
+    iam_client = boto3.client('iam', aws_access_key_id=username, aws_secret_access_key=password, endpoint_url=rgwurl, region_name='')
+    del_provider = iam_client.delete_open_id_connect_provider(
+            OpenIDConnectProviderArn='arn:aws:iam:::oidc-provider/keycloak-demo.cloud.cnaf.infn.it:8221',
+            )
+    oidc_response = iam_client.create_open_id_connect_provider(
+        Url=args.issurl,
+        ClientIDList=clientList,
+        ThumbprintList=["2D0C355758EB2EF529F7E6B3EE41C4647F0B3E8A"]
+    )
+
+    return oidc_response
+
+def still_valid(atok):
+    """
+    Check the validity of the access token.
+    """
+    access_token = atok
+    claims_encoded = access_token.split('.')[1]
+    claims_decoded = base64.b64decode(claims_encoded+"=======")
+    claims = json.loads(claims_decoded)
+    if claims["exp"] - 5 < int(time.time()):
+        return False
+    return True
+
+
+if __name__ == "__main__":
+    # Send device code request.
+    devcode = device_code()
+    # Wait for user authentication with IAM and authorization using the produced user code.
+    input("authorize the device by visiting {} and using the code {} then press enter after the process is complete.".format(devcode.json()['verification_uri'], devcode.json()['user_code']))
+    # Use the produced device code to retrieve access, refresh and id tokens.
+    dev2auth = device_token(devicecode=devcode.json()['device_code'])
+    # Collect the access token.
+    access_token = dev2auth.json()['access_token']
+    print(dev2auth.json())
+    #while True:
+    #    # If access token not valid, use refresh token to produce a new access token.
+    #    if not still_valid(access_token):
+    #        print("access token expired, refreshing ....\n")
+    #        refresh_response = refresh2token(refresh_token=dev2auth.json()['refresh_token'])
+    #        access_token = refresh_response.json()['access_token']
+    #        print("the access token is: \n"+access_token+"\n")
+    #    # Get user info from IAM.
+    scim_info = get_users(access_token)
+    print(scim_info)
+    #    # Produce the new json.
+    #docfopa = OPAvdoc(scim_info)
+    #    # Update OPA.
+    #    #testopa = requests.put("https://keycloak-demo.cloud.cnaf.infn.it:8181/v1/data/iam", data=json.dumps(docfopa), headers = {"Content-Type": "application/json"})
+    #    #print("OPA update "+str(datetime.now()))
+    #    time.sleep(15)
+
+
+
